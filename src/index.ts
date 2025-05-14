@@ -7,9 +7,19 @@ import { ethers } from 'ethers';
 import db from '../config/db_config';
 import { Server } from 'socket.io';
 import http from 'http';
+let tradingIntervalId: NodeJS.Timeout | null = null;
 
 const app = express();
 const server = http.createServer(app);
+
+const cors = require('cors');
+
+
+app.use(cors()); // ✅ Enables CORS for all origins
+
+// OR, to allow only Angular dev server:
+app.use(cors());
+
 
 const io = new Server(server, {
   cors: {
@@ -114,47 +124,66 @@ async function getSpotMeta() {
     return cachedData;
   }
   try {
-    console.log('Fetching spot metadata...');
+    console.log('Fetching spot metadata from Hyperliquid...');
     const response = await axios.post(
       `${hyperliquidBaseUrl}/info`,
       { type: 'spotMeta' },
       { headers: { 'Content-Type': 'application/json' } }
     );
-    cache.set('spotMeta', response.data);
-    // console.log('Fetched spot metadata',response.data);
+    // console.log('Hyperliquid spotMeta response:', JSON.stringify(response.data, null, 2));
+    if (!response.data?.tokens) {
+      throw new Error('No tokens found in spotMeta response');
+    }
+    // cache.set('spotMeta', response.data);
     return response.data;
   } catch (error) {
     console.error('Error fetching spot meta:', error);
+    if (error) {
+      console.error('Response data:', JSON.stringify(error, null, 2));
+    }
     throw error;
   }
 }
 
-async function getPriceHistory(tokenName: any, days = 1) {
-  const tokenIdMap: any = {
-    USDC: 'usd-coin',
-    HYPE: 'hyperliquid',
+async function getPriceHistory(tokenName: string, days = 1) {
+  // Updated tokenIdMap with major cryptocurrencies
+  const tokenIdMap: { [key: string]: string } = {
+    SOL: 'solana',
+    UBTC: "Unit Bitcoin",
+    ETH: 'ethereum',
+    XRP: 'ripple',
+    ADA: 'cardano',
+    // Add more tokens as needed
   };
-  const tokenId = tokenIdMap[tokenName];
 
-  if (tokenId) {
+  const tokenId = '0x8f254b963e8468305d409b33aa137c67'
+if (tokenId) {
     try {
+      console.log(`Fetching CoinGecko price history for ${tokenName} (mapped to ${tokenId})`);
       const response = await axios.get(
         `https://api.coingecko.com/api/v3/coins/${tokenId}/market_chart`,
         { params: { vs_currency: 'usd', days } }
       );
+
+      console.log("response",response);
       return response.data.prices.map(([timestamp, price]: [number, number]) => ({
         date: new Date(timestamp).toLocaleString(),
         price,
       }));
-    } catch (error) {
-      console.error('Error fetching price history:', error);
+    } catch (error: any) {
+      console.error(`Error fetching CoinGecko price history for ${tokenName}:`, error.message);
+      // logger.error(`Error fetching CoinGecko price history for ${tokenName}`, { message: error.message });
+      throw error;
     }
   }
 
+
+  console.warn(`Token ${tokenName} not found in tokenIdMap. Returning mock data.`);
   return Array.from({ length: days * 24 }, (_, i) => ({
     date: new Date(Date.now() - (days * 24 - i - 1) * 60 * 60 * 1000).toLocaleString(),
     price: 1 + (Math.random() - 0.5) * 0.1,
   }));
+
 }
 
 async function analyzeWithGrok(data: any, mode: 'buy' | 'sell', token?: any) {
@@ -278,9 +307,18 @@ async function placeBuyOrder(tokenName: string, amount: number, price: number, t
         `INSERT INTO trades (token_name, token_address, amount, buy_price, buy_time, order_id, status)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [tokenName, tokenAddress, formattedAmount, formattedPrice, buyTime, orderId, 'open'],
-        (err) => {
+        (err,result) => {
           if (err) reject(err);
-          else resolve(null);
+          else{
+            const newTrade = {
+              id: result.insertId,
+              tokenName, tokenAddress, amount: formattedAmount,
+              token_name:tokenName,
+              buy_price: formattedPrice, buyTime, orderId, status: 'open'
+            };
+            globalThis.io.emit('new_trade', newTrade);
+            resolve(result.insertId);
+          } 
         }
       );
     });
@@ -314,8 +352,10 @@ async function checkAndSellPositions() {
       }
 
       for (const trade of results) {
-        const priceHistory = await getPriceHistory(trade.token_name);
-        const latestPrice = priceHistory[0]?.price || trade.buy_price;
+        const priceHistory = await getPriceHistory('ETH');
+        // console.log("priceHistory",priceHistory)
+    
+        const latestPrice = 123;
 
         const profitLoss = (latestPrice - trade.buy_price) * trade.amount;
         const analysis:any = await analyzeWithGrok({ priceHistory }, 'sell', {
@@ -330,10 +370,24 @@ async function checkAndSellPositions() {
             `UPDATE trades SET sell_price = ?, sell_time = ?, profit_loss = ?, status = 'closed' WHERE id = ?`,
             [latestPrice, Date.now(), profitLoss, trade.id],
             (updateErr: any) => {
-              if (updateErr) console.error('Sell update error:', updateErr);
-              else console.log(`Sold ${trade.token_name} for ${profitLoss.toFixed(2)} USD`);
+              if (updateErr) {
+                console.error('Sell update error:', updateErr);
+              } else {
+                console.log(`Sold ${trade.token_name} for ${profitLoss.toFixed(2)} USD`);
+          
+                // ✅ Emit trade_updated to all connected clients
+                globalThis.io.emit('trade_updated', {
+                  id: trade.id,
+                  sell_price: latestPrice,
+                  sellTime: Date.now(),
+                  profit_loss:profitLoss,
+                  token_name:trade.token_name,
+                  status: 'closed',
+                });
+              }
             }
           );
+          
         } else {
           console.log(`Hold ${trade.token_name}`);
         }
@@ -344,30 +398,63 @@ async function checkAndSellPositions() {
   }
 }
 
+// async function startTradingLoop() {
+//   setInterval(async () => {
+//     console.log('Checking buy signals...');
+//     // await startTrade();
+//     console.log('Checking sell signals...');
+//     await checkAndSellPositions();
+//   }, 1000 * 60 * 1); // every 5 minutes
+// }
+
 async function startTradingLoop() {
-  setInterval(async () => {
+  if (tradingIntervalId) {
+    console.log('Trading loop is already running.');
+    return;
+  }
+
+  tradingIntervalId = setInterval(async () => {
     console.log('Checking buy signals...');
-    // await startTrade();
+    await startTrade();
     console.log('Checking sell signals...');
-    await checkAndSellPositions();
-  }, 1000 * 60 * 1); // every 5 minutes
+    // await checkAndSellPositions();
+  }, 1000 * 60 * 1); // every 1 minute
 }
+
+
+
+const mainCoins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'AVAX', 'DOT', 'TRX', 'SHIB', 'MATIC', 'LTC', 'LINK', 'TON'];
 
 async function startTrade() {
   try {
     const spotData = await getSpotMeta();
-    const tokens = spotData.tokens || [];
-
-    for (const token of tokens) {
+    const tokens = spotData || [];
+    const tradingStarted = tokens.universe;
+    // console.log("token",tokens.uni);
+    //  return
+    for (const token of tradingStarted) {
+      console.log("token name ",token.name)
       if (!token.name) {
         console.warn('Skipping invalid token:', token);
         continue;
       }
-      const priceHistory = await getPriceHistory(token.name);
+
+        // ✅ Filter only main coins
+  // if (!mainCoins.includes(token.name.toUpperCase())) {
+  //   console.log(`Skipping meme or unknown coin: ${token.name}`);
+  //   continue;
+  // }
+
+      // const priceHistory:any = await getPriceHistory(token.name);
+      const priceHistory:any  = await getCandleData('BTC', '5m', startTime, endTime);
+
+      console.log("priceHistory",priceHistory)
+
       const analysis:any = await analyzeWithGrok({ token, priceHistory }, 'buy', token);
       console.log(`Analysis for ${token.name}:`, analysis);
       if (analysis.includes('Buy Signal: Yes')) {
-        const currentPrice = priceHistory[0]?.price;
+        const currentPrice = priceHistory[priceHistory.length - 1];
+        console.log("currentPrice",currentPrice)
         if (!currentPrice) {
           console.warn(`No valid price for ${token.name}, skipping.`);
           continue;
@@ -375,7 +462,7 @@ async function startTrade() {
         console.log(`Current Price for ${token.name}: ${currentPrice}`); // Log price
         const tradeSize = tradingState.capital * 0.01;
         const amount = tradeSize / currentPrice;
-        await placeBuyOrder(token.name, amount, currentPrice);
+        await placeBuyOrder('BTC', amount, currentPrice);
         console.log(`Bought ${token.name} at $${currentPrice}`);
       } else {
         console.log(`No buy signal for ${token.name}`);
@@ -387,12 +474,236 @@ async function startTrade() {
 }
 
 app.get('/start', async (req, res) => {
-
+//  const data = await getSpotMeta() 
   console.log('Starting trading loop...');
+
   startTradingLoop();
-  res.send('Trading bot started!');
+  res.json({'Trading Started':"data"});
 });
 
+
+// Real-time connection
+io.on('connection', (socket) => {
+  console.log('Client connected');
+
+  // Send all existing trades on connection
+  db.query('SELECT * FROM trades', (err, results) => {
+    // console.log("results",results);
+    if (!err) {
+      socket.emit('all_trades', results);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+  });
+});
+
+app.get('/stop', (req, res) => {
+  if (tradingIntervalId) {
+    clearInterval(tradingIntervalId);
+    tradingIntervalId = null;
+    console.log('Trading loop stopped.');
+    res.json({ message: 'Trading stopped' });
+  } else {
+    console.log('No trading loop is running.');
+    res.status(400).json({ message: 'Trading is not running' });
+  }
+});
+
+
+// const axios = require('axios');
+
+async function getCandleData(coin:any, interval:any, startTime:any, endTime:any) {
+  // try {
+  //   const response = await axios.post('https://api.hyperliquid.xyz/info', {
+  //     type: 'candleSnapshot',
+  //     req: {
+  //       coin: coin, // e.g., 'BTC' for BTC-PERP
+  //       interval: interval, // e.g., '1m' for 1-minute candles
+  //       startTime: startTime, // e.g., 1696118400000 (Oct 1, 2023, 00:00 UTC)
+  //       endTime: endTime // e.g., 1696204800000 (Oct 2, 2023, 00:00 UTC)
+  //     }
+  //   }, {
+  //     headers: { 'Content-Type': 'application/json' }
+  //   });
+
+  //   // console.log('Candlestick Data:', JSON.stringify(response.data, null, 2));
+  //   return response.data;
+  // } catch (error) {
+  //   console.error('Error fetching candlestick data:', error || error);
+  //   throw error;
+  // }
+  return
+}
+
+// Example usage
+const coin = 'BTC'; // BTC-PERP
+const endTime = new Date().getTime();
+const startTime = endTime - 24 * 60 * 60 * 1000; // 24 hours ago
+// const candles = await getCandleData(tokenName, '5m', startTime, endTime);
+
+
+// const axios = require('axios');
+async function getCurrentPrice(coin: string): Promise<any> {
+  try {
+    // Method 1: Using allMids endpoint (most efficient for just getting price)
+    const response = await axios.post('https://api.hyperliquid.xyz/info', {
+      type: 'allMids'
+    }, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    console.log(response)
+const coinArray = Object.entries(response.data)
+  .filter(([key, value]) => !key.startsWith('@')) // Only keep actual coin names
+  .map(([key, value]):any => ({
+    symbol: key,
+    price: (value)
+  }));
+
+console.log(coinArray);
+    
+    // Find the specific coin in the response
+    const btc = coinArray.find(c => c.symbol === 'BTC');
+console.log(btc);
+  return btc;
+   } catch (error) {
+    console.error(`Error fetching current price for ${coin}:`, error);
+    throw error;
+  }
+}
+
+// Example usage
+// getCurrentPrice('BTC')
+//   .then(price => {
+//     console.log(`Current ${coin} Price: $${price}`);
+//   })
+//   .catch(error => {
+//     console.error('Failed to fetch current price:', error);
+//   });
+
+
+
+// import { ethers } from 'ethers';
+
+// import { ethers } from 'ethers';
+
+async function placeBuyOrders(coin: string, dollarAmount: number, useMarketPrice: boolean = false): Promise<string> {
+  try {
+    // First, get the current price of the coin
+    const currentPrice = await getCurrentPrice(coin);
+    
+    if (!currentPrice || !currentPrice.price) {
+      throw new Error(`Could not get valid price for ${coin}`);
+    }
+    
+    const price = parseFloat(currentPrice.price);
+    console.log(`Current price of ${coin}: $${price}`);
+    
+    // Calculate the size based on the dollar amount
+    // Size = Dollar Amount / Current Price
+    const size = dollarAmount / price;
+    
+    // Format size to appropriate precision (usually 4-6 decimal places for crypto)
+    const formattedSize = size.toFixed(6);
+    
+    console.log(`Attempting to place buy order for ${coin}, amount: $${dollarAmount}, size: ${formattedSize}`);
+    
+    // Get private key from environment variables
+    const privateKey = process.env.PRIVATE_KEY;
+    
+    if (!privateKey) {
+      throw new Error('PRIVATE_KEY environment variable is not set');
+    }
+    
+    // Create wallet from private key
+    const wallet = new ethers.Wallet(privateKey);
+    const address = wallet.address;
+    
+    console.log(`Using wallet address: ${address}`);
+    
+    // Create the order payload according to Hyperliquid docs
+    const orderPayload: any = {
+      coin,
+      side: 'B', // B for Buy, A for Ask/Sell
+      sz: formattedSize, // Size must be a string
+      oid: Date.now().toString(), // Order ID, using timestamp for simplicity
+    };
+    
+    // For limit orders vs market orders
+    if (!useMarketPrice) {
+      // Limit order at current price - make sure to use the actual price value as a string
+      orderPayload.limit = price.toString();
+      orderPayload.tif = 'Gtc'; // Good till cancelled
+    } else {
+      // Market order
+      orderPayload.tif = 'Ioc'; // Immediate or cancel
+    }
+    
+    // Create the action object - try with req field as per some API docs
+    const action = {
+      type: 'order',
+      order: orderPayload // Try changing this to 'req' if it doesn't work
+    };
+    
+    // Log the action to verify it's correct
+    console.log('Action payload:', JSON.stringify(action, null, 2));
+    
+    // Create the message to sign (according to Hyperliquid docs)
+    const message = JSON.stringify(action);
+    
+    // Sign the message - ethers v6 version
+    // First hash the message with keccak256
+    const messageHash = ethers.keccak256(ethers.toUtf8Bytes(message));
+    // Then sign the hash
+    const messageHashBytes = ethers.getBytes(messageHash);
+    const signature = await wallet.signMessage(messageHashBytes);
+    
+    console.log('Message signed successfully');
+    
+    // Create the request payload
+    const requestPayload = {
+      action,
+      signature,
+      address
+    };
+    
+    // Log the full request payload
+    console.log('Request payload:', JSON.stringify(requestPayload, null, 2));
+    // return signature;
+    // Send the request
+    const response = await axios.post('https://api.hyperliquid.xyz/exchange', requestPayload, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    console.log('Buy order response:', JSON.stringify(response.data, null, 2));
+    
+    // Extract order ID from response
+    const orderId = response.data.response?.data?.oid || 'unknown';
+    
+    return orderId;
+  } catch (error) {
+    console.error('Buy order error:', error);
+    if (error) {
+      console.error('Response status:', error);
+      console.error('Response data:', error);
+    }
+    throw error;
+  }
+}
+
+
+
+// Market buy order
+placeBuyOrders('BTC', 15)
+  .then((orderId:any) => console.log(`Market buy order placed with ID: ${orderId}`))
+  .catch((error:any) => console.error('Failed to place market buy order:', error));
+
+
+
+
+
+  
 
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
